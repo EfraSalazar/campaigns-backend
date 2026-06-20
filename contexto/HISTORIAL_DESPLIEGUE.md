@@ -1,5 +1,31 @@
 # Historial de despliegue campaigns
 
+## 2026-06-20 - Migracion de WhatsApp a la cuenta `efras`
+
+Solo el backend de **campanas** se migro de la cuenta `tangente` a la cuenta nueva
+`efras` de la gateway tangentemexico (registro se queda en `tangente`). El host de la
+gateway NO cambio (`guadalajara.tangentemexico.com`); cambio la cuenta: el path, el
+Remitente y el token.
+
+| | Antes (`tangente`) | Ahora (`efras`) |
+|---|---|---|
+| BaseUrl | `.../api/send` | `.../efras/api/send` |
+| Remitente | `tangente` | `efras` |
+| Token (`WhatsAppSettings__ApiKey`) | `w26_81aee...` | `w26_457032e...` |
+
+Cambios aplicados:
+- Repo `campaigns-backend/appsettings.json`: `BaseUrl` y `Remitente` -> `efras`.
+- VPS `/var/www/event-campaign-api/appsettings.json`: idem (sed in-place).
+- VPS `/etc/event-campaign-api.env`: `WhatsAppSettings__ApiKey` -> token nuevo `efras`.
+- Backups en `/var/www/backups/appsettings-event-campaign-api-<ts>.bak` y
+  `event-campaign-api.env-<ts>.bak`.
+- `systemctl restart event-campaign-api` -> arranco OK (`Now listening :5001`),
+  API publica responde 200.
+
+Verificacion previa: el endpoint `efras` se probo directo (curl) y entrego un mensaje
+a 5217771619340 (`{"ok":true,...}`). Pendiente opcional: prueba end-to-end mandando una
+campana real desde la UI. El script de prueba local es `~/Downloads/whatsapp26-csharp-efras.cs`.
+
 ## 2026-06-13 - Despliegue inicial a VPS IONOS
 
 Modulo de campanas desplegado a produccion en el VPS IONOS (`198.251.74.66`), junto al registro.
