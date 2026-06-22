@@ -490,6 +490,16 @@ public class CampaignsController : ControllerBase
                 .Where(r => !sentSet.Contains(r.ContactId))
                 .ToList();
 
+            // Dedupe por dirección real: si dos contactos distintos comparten el mismo correo/teléfono,
+            // que ya se le envió a esa dirección en esta campaña (por este canal) no debe volver a enviarse.
+            var sentAddresses = await context.CommunicationLogs
+                .Where(l => l.CampaignId == campaign.Id && l.Channel == effectiveChannel && l.Status == "Sent")
+                .Select(l => l.Recipient)
+                .ToListAsync();
+            var seenAddresses = new HashSet<string>(
+                sentAddresses.Where(a => !string.IsNullOrWhiteSpace(a)),
+                StringComparer.OrdinalIgnoreCase);
+
             var testTarget = isEmail ? sending.TestEmail : sending.TestPhone;
             if (sending.TestMode)
             {
@@ -566,11 +576,36 @@ public class CampaignsController : ControllerBase
                     continue;
                 }
 
+                if (seenAddresses.Contains(realAddress))
+                {
+                    // Mismo destino real que otro contacto ya cubierto en esta campaña/canal: no se reenvía.
+                    recipient.Status = "Sent";
+                    recipient.SentAt = DateTime.UtcNow;
+                    recipient.ErrorMessage = null;
+                    context.CommunicationLogs.Add(new CommunicationLog
+                    {
+                        CampaignId = campaign.Id,
+                        ContactId = recipient.ContactId,
+                        Channel = effectiveChannel,
+                        Recipient = realAddress,
+                        Status = "Sent",
+                        ProviderResponse = "Duplicado: mismo destino que otro contacto en esta campaña",
+                        CreatedAt = DateTime.UtcNow
+                    });
+                    await context.SaveChangesAsync();
+                    continue;
+                }
+
                 // En Modo Prueba se redirige el destino real al de prueba y se marca el contenido.
+                // El check de HTML se hace ANTES de anteponer el aviso de prueba, porque si no,
+                // el texto ya no empieza con "<" y se trataría como texto plano (se escaparía el HTML).
+                var isHtmlMessage = LooksLikeHtml(text);
                 var destination = sending.TestMode ? testTarget : realAddress;
                 if (sending.TestMode)
                 {
-                    text = $"[PRUEBA → {realAddress}]\n\n{text}";
+                    text = isHtmlMessage
+                        ? $"<div style='background:#fff3cd;color:#7a5b00;padding:10px 14px;font-family:Arial,sans-serif;font-size:13px;border-radius:8px;margin-bottom:14px;'>[PRUEBA → {System.Net.WebUtility.HtmlEncode(realAddress)}]</div>{text}"
+                        : $"[PRUEBA → {realAddress}]\n\n{text}";
                 }
 
                 // Demora aleatoria de 30-90s entre mensajes de WhatsApp para que el envío no se
@@ -589,7 +624,7 @@ public class CampaignsController : ControllerBase
                 {
                     if (isEmail)
                     {
-                        var html = TextToHtml(text);
+                        var html = isHtmlMessage ? text : TextToHtml(text);
                         var subject = sending.TestMode ? $"[PRUEBA] {campaign.Subject ?? campaign.Name}" : (campaign.Subject ?? campaign.Name);
                         await emailService.SendAsync(destination, displayName, subject, html, emailAttachments);
                         status = "Sent";
@@ -621,6 +656,7 @@ public class CampaignsController : ControllerBase
                     recipient.SentAt = DateTime.UtcNow;
                     recipient.ErrorMessage = null;
                     sent++;
+                    seenAddresses.Add(realAddress);
                 }
                 else
                 {
@@ -688,6 +724,8 @@ public class CampaignsController : ControllerBase
         // Texto plano -> HTML simple, respetando saltos de línea.
         return $"<div style='font-family:Arial,sans-serif;font-size:15px;color:#333;white-space:pre-wrap;'>{System.Net.WebUtility.HtmlEncode(text).Replace("\n", "<br>")}</div>";
     }
+
+    private static bool LooksLikeHtml(string text) => text.TrimStart().StartsWith("<");
 
     [HttpDelete("{id:int}/recipients")]
     public async Task<IActionResult> ClearRecipients(int id)
