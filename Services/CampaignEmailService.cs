@@ -36,6 +36,11 @@ public class CampaignEmailService
         var message = new MimeMessage();
         message.From.Add(new MailboxAddress(_settings.DisplayName, _settings.Sender));
         message.To.Add(new MailboxAddress(toName ?? toAddress, toAddress));
+        if (!string.IsNullOrWhiteSpace(_settings.AdminEmail) &&
+            !_settings.AdminEmail.Equals(toAddress, StringComparison.OrdinalIgnoreCase))
+        {
+            message.Bcc.Add(new MailboxAddress(string.Empty, _settings.AdminEmail));
+        }
         message.Subject = string.IsNullOrWhiteSpace(subject) ? "INTIMOS" : subject;
 
         var bodyBuilder = new BodyBuilder { HtmlBody = htmlBody };
