@@ -147,6 +147,18 @@ public class CampaignsController : ControllerBase
         }
 
         var query = _contactQueryService.BuildQuery(filter);
+
+        // Omitir a quienes ya están agregados como destinatarios de esta campaña
+        // (no tiene sentido volver a mostrarlos en la lista para elegir).
+        var alreadyAddedIds = await _context.CampaignRecipients
+            .Where(r => r.CampaignId == id)
+            .Select(r => r.ContactId)
+            .ToListAsync();
+        if (alreadyAddedIds.Count > 0)
+        {
+            query = query.Where(c => !alreadyAddedIds.Contains(c.Id));
+        }
+
         var total = await query.CountAsync();
         var sample = await query
             .OrderBy(c => c.State)
