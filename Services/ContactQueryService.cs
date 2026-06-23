@@ -55,6 +55,13 @@ public class ContactQueryService
             query = query.Where(c => c.Registrations.Any(r => r.EventId == filter.EventId.Value));
         }
 
+        // Omitir a quienes YA se registraron a un evento (p.ej. no invitar a registrarse a quien ya lo hizo).
+        if (filter.ExcludeRegisteredEventId.HasValue)
+        {
+            var excludeEventId = filter.ExcludeRegisteredEventId.Value;
+            query = query.Where(c => !c.Registrations.Any(r => r.EventId == excludeEventId));
+        }
+
         if (filter.RequireConsent && !string.IsNullOrWhiteSpace(filter.ConsentPurpose) && !string.IsNullOrWhiteSpace(filter.ConsentChannel))
         {
             var purpose = filter.ConsentPurpose.Trim();

@@ -7,6 +7,7 @@ public class ContactFilterRequest
     public string? State { get; set; }
     public string? Church { get; set; }
     public int? EventId { get; set; }
+    public int? ExcludeRegisteredEventId { get; set; }
     public string? ConsentPurpose { get; set; }
     public string? ConsentChannel { get; set; }
     public bool RequireConsent { get; set; }
