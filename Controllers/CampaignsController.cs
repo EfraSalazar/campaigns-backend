@@ -402,7 +402,21 @@ public class CampaignsController : ControllerBase
 
         if (campaign.Status == "Sending")
         {
-            return Conflict(new { error = "Esta campaña ya se está enviando." });
+            // Detectar un envío atascado: el envío corre como una tarea en memoria que puede
+            // tardar horas (por el throttle). Si el servicio se reinicia o lo mata el SO a media
+            // lista, la tarea muere pero el estado queda en "Sending" para siempre. Si no hay
+            // actividad reciente (último log de la campaña), asumimos que murió y permitimos
+            // reanudar: el dedup por campaña solo omite los ya enviados, así que continúa con
+            // los pendientes/fallidos sin duplicar.
+            var lastActivity = await _context.CommunicationLogs
+                .Where(l => l.CampaignId == id)
+                .MaxAsync(l => (DateTime?)l.CreatedAt);
+            var stale = lastActivity == null || (DateTime.UtcNow - lastActivity.Value) > TimeSpan.FromMinutes(5);
+            if (!stale)
+            {
+                return Conflict(new { error = "Esta campaña ya se está enviando." });
+            }
+            // Atascada: se reanuda más abajo (se vuelve a poner en "Sending" antes de arrancar).
         }
 
         // El canal se puede elegir al enviar; si no se indica, se usa el de la campaña.
@@ -429,9 +443,11 @@ public class CampaignsController : ControllerBase
         // (según CommunicationLogs). Así el mismo destinatario puede recibir por Email y por WhatsApp.
         var campaignContactIds = campaign.Recipients.Select(r => r.ContactId).ToHashSet();
 
-        // Saltamos contactos ya enviados en ESTA campaña (por canal) + en CUALQUIER otra campaña.
+        // Saltamos contactos ya enviados con éxito en ESTA campaña (por canal), para no
+        // duplicar si se reintenta el envío. La deduplicación es por campaña: cada campaña
+        // nueva puede llegar a todos otra vez, aunque ya hayan recibido campañas anteriores.
         var alreadySentContactIds = await _context.CommunicationLogs
-            .Where(l => l.Status == "Sent" && l.Channel == effectiveChannel
+            .Where(l => l.CampaignId == campaign.Id && l.Status == "Sent" && l.Channel == effectiveChannel
                      && l.ContactId != null && campaignContactIds.Contains(l.ContactId!.Value))
             .Select(l => l.ContactId!.Value)
             .Distinct()
@@ -490,8 +506,10 @@ public class CampaignsController : ControllerBase
             if (campaign == null) return;
 
             var campaignContactIds = campaign.Recipients.Select(r => r.ContactId).ToHashSet();
+            // Dedup por campaña: solo se omiten los ya enviados con éxito en ESTA misma
+            // campaña (por canal), para permitir reintentos sin duplicar.
             var alreadySentContactIds = await context.CommunicationLogs
-                .Where(l => l.Status == "Sent" && l.Channel == effectiveChannel
+                .Where(l => l.CampaignId == campaign.Id && l.Status == "Sent" && l.Channel == effectiveChannel
                          && l.ContactId != null && campaignContactIds.Contains(l.ContactId!.Value))
                 .Select(l => l.ContactId!.Value)
                 .Distinct()
@@ -620,11 +638,24 @@ public class CampaignsController : ControllerBase
                         : $"[PRUEBA → {realAddress}]\n\n{text}";
                 }
 
-                // Demora aleatoria de 30-90s entre mensajes de WhatsApp para que el envío no se
-                // vea como mensajería masiva (no se aplica antes del primer mensaje).
-                if (isWhatsApp && !isFirstSend)
+                // Demora entre mensajes para no exceder los límites del proveedor (no se aplica
+                // antes del primer envío). WhatsApp: 30-90s para no verse como mensajería masiva.
+                // Email: pausa configurable (Sending:EmailDelay*) para no disparar el límite
+                // anti-spam del buzón SMTP, que rechaza con "Sending limit reached" si se envía
+                // demasiado rápido (Namecheap ~300/hora).
+                if (!isFirstSend)
                 {
-                    await whatsAppService.DelayBeforeNextSendAsync();
+                    if (isWhatsApp)
+                    {
+                        await whatsAppService.DelayBeforeNextSendAsync();
+                    }
+                    else if (isEmail)
+                    {
+                        var min = Math.Max(0, sending.EmailDelayMinMs);
+                        var max = Math.Max(min, sending.EmailDelayMaxMs);
+                        var delayMs = min == max ? min : Random.Shared.Next(min, max + 1);
+                        if (delayMs > 0) await Task.Delay(delayMs);
+                    }
                 }
                 isFirstSend = false;
 
