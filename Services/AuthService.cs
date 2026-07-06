@@ -1,5 +1,3 @@
-using System.Security.Cryptography;
-using System.Text;
 using EventCampaignSystem.Data;
 using EventCampaignSystem.Models;
 using Microsoft.EntityFrameworkCore;
@@ -25,19 +23,8 @@ public class AuthService
             return null;
         }
 
-        return VerifyPassword(password, user.PasswordHash, user.Salt) ? user : null;
-    }
-
-    private static string HashPassword(string password, string salt)
-    {
-        using var sha256 = SHA256.Create();
-        var saltedPassword = string.Concat(password, salt);
-        var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(saltedPassword));
-        return Convert.ToBase64String(hashBytes);
-    }
-
-    private static bool VerifyPassword(string password, string storedHash, string storedSalt)
-    {
-        return HashPassword(password, storedSalt) == storedHash;
+        // Verifica ambos esquemas (SHA256 heredado y PBKDF2). El re-hasheo a PBKDF2
+        // lo realiza registration-backend al iniciar sesión; aquí solo se lee.
+        return PasswordHasher.Verify(password, user.PasswordHash, user.Salt) ? user : null;
     }
 }
