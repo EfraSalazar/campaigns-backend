@@ -56,6 +56,11 @@ builder.Services.AddHttpClient("WhatsAppApi", client =>
 
 builder.Services.AddScoped<AuthService>();
 
+// Singleton: mantiene el registro de envíos activos del proceso; crea sus propios scopes.
+builder.Services.AddSingleton<CampaignSendService>();
+// Worker de campañas programadas (revisa cada minuto las Status="Scheduled" vencidas).
+builder.Services.AddHostedService<ScheduledCampaignWorker>();
+
 var jwtKey = builder.Configuration["Jwt:Key"];
 if (string.IsNullOrWhiteSpace(jwtKey))
 {
@@ -81,15 +86,43 @@ builder.Services.AddAuthentication(options =>
     };
 });
 
+// Orígenes permitidos por config (Cors:AllowedOrigins). En producción el panel se sirve
+// desde el mismo dominio, pero se restringe igualmente para que ningún otro sitio pueda
+// llamar la API desde un navegador con las cookies/tokens del admin.
+var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
+    ?? new[] { "https://intimosconf.com" };
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("LocalCampaignAdmin", policy =>
-        policy.AllowAnyOrigin()
+        policy.WithOrigins(allowedOrigins)
             .AllowAnyHeader()
             .AllowAnyMethod());
 });
 
 var app = builder.Build();
+
+// Recuperar campañas huérfanas: si el servicio se reinició a media campaña, la tarea de envío
+// murió y el estado quedó en "Sending". Se resetean a "Draft" para poder reanudarlas; la
+// deduplicación por CommunicationLogs garantiza que al re-enviar no se duplica a quien ya recibió.
+using (var startupScope = app.Services.CreateScope())
+{
+    try
+    {
+        var db = startupScope.ServiceProvider.GetRequiredService<CampaignDbContext>();
+        var recovered = await db.Campaigns
+            .Where(c => c.Status == "Sending")
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.Status, "Draft"));
+        if (recovered > 0)
+        {
+            app.Logger.LogWarning("Se recuperaron {Count} campaña(s) atorada(s) en 'Sending' (reseteadas a 'Draft')", recovered);
+        }
+    }
+    catch (Exception ex)
+    {
+        // No impedir el arranque si la BD aún no está lista; el rescate por inactividad (>5 min) sigue disponible.
+        app.Logger.LogError(ex, "No se pudieron recuperar campañas atoradas al arrancar");
+    }
+}
 
 if (app.Environment.IsDevelopment())
 {

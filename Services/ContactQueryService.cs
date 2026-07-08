@@ -16,9 +16,10 @@ public class ContactQueryService
 
     public IQueryable<Contact> BuildQuery(ContactFilterRequest filter)
     {
-        var query = _context.Contacts
-            .Include(c => c.Registrations)
-            .AsQueryable();
+        // Sin Include(Registrations): quien necesite los conteos usa ProjectToResponse
+        // (subquery en SQL); materializar todos los registros de cada contacto era la
+        // fuente principal de carga en previews de hasta 2000 contactos.
+        var query = _context.Contacts.AsQueryable();
 
         if (!string.IsNullOrWhiteSpace(filter.Search))
         {
@@ -73,6 +74,29 @@ public class ContactQueryService
         }
 
         return query;
+    }
+
+    /// <summary>
+    /// Proyección a ContactResponse traducida a SQL (los conteos salen como subqueries,
+    /// sin cargar los registros de cada contacto en memoria).
+    /// </summary>
+    public static IQueryable<ContactResponse> ProjectToResponse(IQueryable<Contact> query)
+    {
+        return query.Select(c => new ContactResponse
+        {
+            Id = c.Id,
+            FullName = (c.FirstName + " " + c.LastName + " " + c.SecondLastName).Trim(),
+            Email = c.Email,
+            PhoneNumber = c.PhoneNumber,
+            City = c.City,
+            State = c.State,
+            Church = c.Church,
+            RegistrationCount = c.Registrations.Count,
+            LastRegistrationDate = c.Registrations
+                .OrderByDescending(r => r.RegistrationDate)
+                .Select(r => (DateTime?)r.RegistrationDate)
+                .FirstOrDefault()
+        });
     }
 
     public static ContactResponse ToResponse(Contact contact)

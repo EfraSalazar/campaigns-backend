@@ -20,8 +20,7 @@ public class CampaignsController : ControllerBase
     private readonly CampaignEmailService _emailService;
     private readonly CampaignWhatsAppService _whatsAppService;
     private readonly Models.SendingSettings _sending;
-    private readonly IServiceScopeFactory _scopeFactory;
-    private readonly ILogger<CampaignsController> _logger;
+    private readonly CampaignSendService _sendService;
 
     public CampaignsController(
         CampaignDbContext context,
@@ -29,27 +28,40 @@ public class CampaignsController : ControllerBase
         CampaignEmailService emailService,
         CampaignWhatsAppService whatsAppService,
         Microsoft.Extensions.Options.IOptions<Models.SendingSettings> sending,
-        IServiceScopeFactory scopeFactory,
-        ILogger<CampaignsController> logger)
+        CampaignSendService sendService)
     {
         _context = context;
         _contactQueryService = contactQueryService;
         _emailService = emailService;
         _whatsAppService = whatsAppService;
         _sending = sending.Value;
-        _scopeFactory = scopeFactory;
-        _logger = logger;
+        _sendService = sendService;
     }
 
     [HttpGet]
     public async Task<IActionResult> GetCampaigns()
     {
+        // Projection en SQL (COUNT por subquery) en vez de Include(Recipients): evita cargar
+        // todos los destinatarios de todas las campañas solo para contarlos.
         var campaigns = await _context.Campaigns
-            .Include(c => c.Recipients)
             .OrderByDescending(c => c.CreatedAt)
+            .Select(c => new CampaignResponse
+            {
+                Id = c.Id,
+                Name = c.Name,
+                Purpose = c.Purpose,
+                Channel = c.Channel,
+                Status = c.Status,
+                Subject = c.Subject,
+                MessageTemplate = c.MessageTemplate,
+                CreatedAt = c.CreatedAt,
+                ScheduledAt = c.ScheduledAt,
+                SentAt = c.SentAt,
+                RecipientCount = c.Recipients.Count
+            })
             .ToListAsync();
 
-        return Ok(campaigns.Select(ToResponse));
+        return Ok(campaigns);
     }
 
     [HttpPost]
@@ -160,17 +172,17 @@ public class CampaignsController : ControllerBase
         }
 
         var total = await query.CountAsync();
-        var sample = await query
-            .OrderBy(c => c.State)
-            .ThenBy(c => c.City)
-            .ThenBy(c => c.FirstName)
-            .Take(Math.Clamp(filter.Limit, 1, 2000))
+        var sample = await ContactQueryService.ProjectToResponse(
+                query.OrderBy(c => c.State)
+                    .ThenBy(c => c.City)
+                    .ThenBy(c => c.FirstName)
+                    .Take(Math.Clamp(filter.Limit, 1, 2000)))
             .ToListAsync();
 
         return Ok(new PreviewRecipientsResponse
         {
             Total = total,
-            Sample = sample.Select(ContactQueryService.ToResponse).ToList()
+            Sample = sample
         });
     }
 
@@ -325,6 +337,13 @@ public class CampaignsController : ControllerBase
         return Ok(items);
     }
 
+    // Tipos de archivo permitidos como adjunto: imágenes, PDF, Office y texto plano.
+    private static readonly HashSet<string> AllowedAttachmentExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".jpg", ".jpeg", ".png", ".gif", ".webp",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt"
+    };
+
     [HttpPost("{id:int}/attachments")]
     [RequestSizeLimit(20_000_000)]
     public async Task<IActionResult> UploadAttachment(int id, IFormFile file)
@@ -343,6 +362,12 @@ public class CampaignsController : ControllerBase
         if (file.Length > 16_000_000)
         {
             return BadRequest(new { error = "El archivo supera el límite de 16 MB." });
+        }
+
+        var extension = Path.GetExtension(file.FileName);
+        if (string.IsNullOrWhiteSpace(extension) || !AllowedAttachmentExtensions.Contains(extension))
+        {
+            return BadRequest(new { error = $"Tipo de archivo no permitido ({extension}). Usa imagen, PDF, documento de Office o texto." });
         }
 
         using var ms = new MemoryStream();
@@ -400,24 +425,13 @@ public class CampaignsController : ControllerBase
             return NotFound(new { error = $"No se encontro la campana {id}" });
         }
 
-        if (campaign.Status == "Sending")
+        if (_sendService.IsSending(id))
         {
-            // Detectar un envío atascado: el envío corre como una tarea en memoria que puede
-            // tardar horas (por el throttle). Si el servicio se reinicia o lo mata el SO a media
-            // lista, la tarea muere pero el estado queda en "Sending" para siempre. Si no hay
-            // actividad reciente (último log de la campaña), asumimos que murió y permitimos
-            // reanudar: el dedup por campaña solo omite los ya enviados, así que continúa con
-            // los pendientes/fallidos sin duplicar.
-            var lastActivity = await _context.CommunicationLogs
-                .Where(l => l.CampaignId == id)
-                .MaxAsync(l => (DateTime?)l.CreatedAt);
-            var stale = lastActivity == null || (DateTime.UtcNow - lastActivity.Value) > TimeSpan.FromMinutes(5);
-            if (!stale)
-            {
-                return Conflict(new { error = "Esta campaña ya se está enviando." });
-            }
-            // Atascada: se reanuda más abajo (se vuelve a poner en "Sending" antes de arrancar).
+            return Conflict(new { error = "Esta campaña ya se está enviando." });
         }
+        // Si el Status en BD dice "Sending" pero no hay tarea activa en este proceso, el envío
+        // quedó huérfano (crash o tarea muerta): se permite reanudar. El dedup por campaña solo
+        // omite a los ya enviados, así que continúa con los pendientes/fallidos sin duplicar.
 
         // El canal se puede elegir al enviar; si no se indica, se usa el de la campaña.
         var effectiveChannel = string.IsNullOrWhiteSpace(channel) ? campaign.Channel : channel.Trim();
@@ -468,13 +482,13 @@ public class CampaignsController : ControllerBase
             return StatusCode(503, new { error = $"Modo Prueba activo pero falta {(isEmail ? "Sending:TestEmail" : "Sending:TestPhone")}." });
         }
 
-        campaign.Status = "Sending";
-        await _context.SaveChangesAsync();
-
-        // El envío corre en segundo plano (no atado al request HTTP) porque entre mensajes de WhatsApp
-        // se aplica una demora aleatoria de 30-90s para que la campaña no se vea como mensajería masiva;
-        // eso fácilmente supera el timeout del cliente si se hiciera de forma síncrona.
-        _ = Task.Run(() => ProcessCampaignSendAsync(campaign.Id, effectiveChannel, isEmail, isWhatsApp));
+        // El servicio reclama el envío de forma atómica (dos clics simultáneos → uno recibe 409)
+        // y lo corre en segundo plano; ver CampaignSendService.
+        var started = await _sendService.TryStartSendAsync(campaign.Id, effectiveChannel, isEmail, isWhatsApp);
+        if (!started)
+        {
+            return Conflict(new { error = "Esta campaña ya se está enviando." });
+        }
 
         return Accepted(new
         {
@@ -487,288 +501,210 @@ public class CampaignsController : ControllerBase
         });
     }
 
-    private async Task ProcessCampaignSendAsync(int campaignId, string effectiveChannel, bool isEmail, bool isWhatsApp)
+
+    [HttpPost("{id:int}/schedule")]
+    public async Task<IActionResult> ScheduleCampaign(int id, ScheduleCampaignRequest request)
     {
-        using var scope = _scopeFactory.CreateScope();
-        var context = scope.ServiceProvider.GetRequiredService<CampaignDbContext>();
-        var emailService = scope.ServiceProvider.GetRequiredService<CampaignEmailService>();
-        var whatsAppService = scope.ServiceProvider.GetRequiredService<CampaignWhatsAppService>();
-        var sending = scope.ServiceProvider.GetRequiredService<IOptions<Models.SendingSettings>>().Value;
+        var campaign = await _context.Campaigns.FindAsync(id);
+        if (campaign == null) return NotFound(new { error = $"No se encontró la campaña {id}" });
 
-        var sent = 0;
-        var failed = 0;
-
-        try
+        if (_sendService.IsSending(id) || campaign.Status == "Sending")
         {
-            var campaign = await context.Campaigns
-                .Include(c => c.Recipients)
-                .FirstOrDefaultAsync(c => c.Id == campaignId);
-            if (campaign == null) return;
-
-            var campaignContactIds = campaign.Recipients.Select(r => r.ContactId).ToHashSet();
-            // Dedup por campaña: solo se omiten los ya enviados con éxito en ESTA misma
-            // campaña (por canal), para permitir reintentos sin duplicar.
-            var alreadySentContactIds = await context.CommunicationLogs
-                .Where(l => l.CampaignId == campaign.Id && l.Status == "Sent" && l.Channel == effectiveChannel
-                         && l.ContactId != null && campaignContactIds.Contains(l.ContactId!.Value))
-                .Select(l => l.ContactId!.Value)
-                .Distinct()
-                .ToListAsync();
-            var sentSet = alreadySentContactIds.ToHashSet();
-
-            var pending = campaign.Recipients
-                .Where(r => !sentSet.Contains(r.ContactId))
-                .ToList();
-
-            // Dedupe por dirección real: si dos contactos distintos comparten el mismo correo/teléfono,
-            // que ya se le envió a esa dirección en esta campaña (por este canal) no debe volver a enviarse.
-            var sentAddresses = await context.CommunicationLogs
-                .Where(l => l.CampaignId == campaign.Id && l.Channel == effectiveChannel && l.Status == "Sent")
-                .Select(l => l.Recipient)
-                .ToListAsync();
-            var seenAddresses = new HashSet<string>(
-                sentAddresses.Where(a => !string.IsNullOrWhiteSpace(a)),
-                StringComparer.OrdinalIgnoreCase);
-
-            var testTarget = isEmail ? sending.TestEmail : sending.TestPhone;
-            if (sending.TestMode)
-            {
-                var cap = Math.Max(1, sending.MaxRecipientsInTestMode);
-                if (pending.Count > cap)
-                {
-                    pending = pending.Take(cap).ToList();
-                }
-            }
-
-            var contactIds = pending.Select(r => r.ContactId).ToList();
-            var contacts = await context.Contacts
-                .Where(c => contactIds.Contains(c.Id))
-                .ToDictionaryAsync(c => c.Id);
-
-            var eventIds = pending.Where(r => r.SourceEventId.HasValue).Select(r => r.SourceEventId!.Value).Distinct().ToList();
-            var events = await context.Events
-                .Where(e => eventIds.Contains(e.Id))
-                .ToDictionaryAsync(e => e.Id, e => e.Name);
-
-            var attachmentRecords = await context.CampaignAttachments
-                .Where(a => a.CampaignId == campaign.Id)
-                .ToListAsync();
-            var emailAttachments = attachmentRecords
-                .Select(a => new CampaignEmailService.Attachment(a.FileName, a.ContentType, a.Content))
-                .ToList();
-            var firstFile = attachmentRecords.Count > 0
-                ? new CampaignWhatsAppService.FileAttachment(
-                    attachmentRecords[0].FileName, attachmentRecords[0].ContentType, attachmentRecords[0].Content)
-                : null;
-
-            var isFirstSend = true;
-
-            foreach (var recipient in pending)
-            {
-                contacts.TryGetValue(recipient.ContactId, out var contact);
-                var eventName = recipient.SourceEventId.HasValue && events.TryGetValue(recipient.SourceEventId.Value, out var en)
-                    ? en
-                    : string.Empty;
-
-                var text = RenderText(campaign.MessageTemplate, contact, eventName);
-                var displayName = contact != null
-                    ? $"{contact.FirstName} {contact.LastName}".Trim()
-                    : recipient.RecipientAddress;
-
-                // El destino real se resuelve del contacto según el canal elegido.
-                var realAddress = isEmail
-                    ? (contact?.Email ?? string.Empty)
-                    : (contact?.PhoneNumber ?? string.Empty);
-
-                // Respaldo: si el contacto no trae el dato pero el address guardado sirve para este canal.
-                if (string.IsNullOrWhiteSpace(realAddress) &&
-                    recipient.RecipientAddress.Contains('@') == isEmail)
-                {
-                    realAddress = recipient.RecipientAddress;
-                }
-
-                if (string.IsNullOrWhiteSpace(realAddress))
-                {
-                    recipient.Status = "Failed";
-                    recipient.ErrorMessage = isEmail ? "Sin correo" : "Sin teléfono";
-                    failed++;
-                    context.CommunicationLogs.Add(new CommunicationLog
-                    {
-                        CampaignId = campaign.Id,
-                        ContactId = recipient.ContactId,
-                        Channel = effectiveChannel,
-                        Recipient = recipient.RecipientAddress,
-                        Status = "Failed",
-                        ErrorMessage = recipient.ErrorMessage,
-                        CreatedAt = DateTime.UtcNow
-                    });
-                    await context.SaveChangesAsync();
-                    continue;
-                }
-
-                if (seenAddresses.Contains(realAddress))
-                {
-                    // Mismo destino real que otro contacto ya cubierto en esta campaña/canal: no se reenvía.
-                    recipient.Status = "Sent";
-                    recipient.SentAt = DateTime.UtcNow;
-                    recipient.ErrorMessage = null;
-                    context.CommunicationLogs.Add(new CommunicationLog
-                    {
-                        CampaignId = campaign.Id,
-                        ContactId = recipient.ContactId,
-                        Channel = effectiveChannel,
-                        Recipient = realAddress,
-                        Status = "Sent",
-                        ProviderResponse = "Duplicado: mismo destino que otro contacto en esta campaña",
-                        CreatedAt = DateTime.UtcNow
-                    });
-                    await context.SaveChangesAsync();
-                    continue;
-                }
-
-                // En Modo Prueba se redirige el destino real al de prueba y se marca el contenido.
-                // El check de HTML se hace ANTES de anteponer el aviso de prueba, porque si no,
-                // el texto ya no empieza con "<" y se trataría como texto plano (se escaparía el HTML).
-                var isHtmlMessage = LooksLikeHtml(text);
-                var destination = sending.TestMode ? testTarget : realAddress;
-                if (sending.TestMode)
-                {
-                    text = isHtmlMessage
-                        ? $"<div style='background:#fff3cd;color:#7a5b00;padding:10px 14px;font-family:Arial,sans-serif;font-size:13px;border-radius:8px;margin-bottom:14px;'>[PRUEBA → {System.Net.WebUtility.HtmlEncode(realAddress)}]</div>{text}"
-                        : $"[PRUEBA → {realAddress}]\n\n{text}";
-                }
-
-                // Demora entre mensajes para no exceder los límites del proveedor (no se aplica
-                // antes del primer envío). WhatsApp: 30-90s para no verse como mensajería masiva.
-                // Email: pausa configurable (Sending:EmailDelay*) para no disparar el límite
-                // anti-spam del buzón SMTP, que rechaza con "Sending limit reached" si se envía
-                // demasiado rápido (Namecheap ~300/hora).
-                if (!isFirstSend)
-                {
-                    if (isWhatsApp)
-                    {
-                        await whatsAppService.DelayBeforeNextSendAsync();
-                    }
-                    else if (isEmail)
-                    {
-                        var min = Math.Max(0, sending.EmailDelayMinMs);
-                        var max = Math.Max(min, sending.EmailDelayMaxMs);
-                        var delayMs = min == max ? min : Random.Shared.Next(min, max + 1);
-                        if (delayMs > 0) await Task.Delay(delayMs);
-                    }
-                }
-                isFirstSend = false;
-
-                string status;
-                string? error = null;
-                string? providerResponse = null;
-
-                try
-                {
-                    if (isEmail)
-                    {
-                        var html = isHtmlMessage ? text : TextToHtml(text);
-                        var subject = sending.TestMode ? $"[PRUEBA] {campaign.Subject ?? campaign.Name}" : (campaign.Subject ?? campaign.Name);
-                        await emailService.SendAsync(destination, displayName, subject, html, emailAttachments);
-                        status = "Sent";
-                    }
-                    else
-                    {
-                        var result = await whatsAppService.SendTextAsync(destination, text, firstFile);
-                        providerResponse = result.ProviderResponse;
-                        if (result.Success)
-                        {
-                            status = "Sent";
-                        }
-                        else
-                        {
-                            status = "Failed";
-                            error = result.Error;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    status = "Failed";
-                    error = ex.Message;
-                }
-
-                if (status == "Sent")
-                {
-                    recipient.Status = "Sent";
-                    recipient.SentAt = DateTime.UtcNow;
-                    recipient.ErrorMessage = null;
-                    sent++;
-                    seenAddresses.Add(realAddress);
-                }
-                else
-                {
-                    recipient.Status = "Failed";
-                    recipient.ErrorMessage = error;
-                    failed++;
-                }
-
-                context.CommunicationLogs.Add(new CommunicationLog
-                {
-                    CampaignId = campaign.Id,
-                    ContactId = recipient.ContactId,
-                    Channel = effectiveChannel,
-                    Recipient = realAddress,
-                    Status = status,
-                    ProviderResponse = providerResponse,
-                    ErrorMessage = error,
-                    CreatedAt = DateTime.UtcNow
-                });
-
-                // Se guarda después de cada destinatario para que el polling del frontend vea el progreso en vivo.
-                await context.SaveChangesAsync();
-            }
-
-            campaign.Status = sent > 0 ? "Sent" : "Failed";
-            if (sent > 0) campaign.SentAt = DateTime.UtcNow;
-            await context.SaveChangesAsync();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error procesando el envío de la campaña {CampaignId}", campaignId);
-            try
-            {
-                var campaign = await context.Campaigns.FindAsync(campaignId);
-                if (campaign != null)
-                {
-                    campaign.Status = sent > 0 ? "Sent" : "Failed";
-                    await context.SaveChangesAsync();
-                }
-            }
-            catch (Exception saveEx)
-            {
-                _logger.LogError(saveEx, "No se pudo marcar como fallida la campaña {CampaignId} tras un error", campaignId);
-            }
-        }
-    }
-
-    private static string RenderText(string template, Models.Contact? contact, string eventName)
-    {
-        if (string.IsNullOrEmpty(template))
-        {
-            return string.Empty;
+            return Conflict(new { error = "Esta campaña se está enviando; no se puede programar." });
         }
 
-        var nombre = contact != null ? contact.FirstName : string.Empty;
-        return template
-            .Replace("{nombre}", nombre)
-            .Replace("{ciudad}", contact?.City ?? string.Empty)
-            .Replace("{iglesia}", contact?.Church ?? string.Empty)
-            .Replace("{evento}", eventName);
+        var channel = string.IsNullOrWhiteSpace(request.Channel) ? campaign.Channel : request.Channel.Trim();
+        var isEmail = channel.Equals("Email", StringComparison.OrdinalIgnoreCase);
+        var isWhatsApp = channel.Equals("WhatsApp", StringComparison.OrdinalIgnoreCase);
+        if (!isEmail && !isWhatsApp)
+        {
+            return BadRequest(new { error = $"Canal no soportado: {channel}." });
+        }
+
+        var now = CampaignSendService.MexicoNow();
+        if (request.ScheduledAt <= now)
+        {
+            return BadRequest(new { error = $"La fecha programada debe ser futura (hora CDMX actual: {now:yyyy-MM-dd HH:mm})." });
+        }
+
+        var hasRecipients = await _context.CampaignRecipients.AnyAsync(r => r.CampaignId == id);
+        if (!hasRecipients)
+        {
+            return BadRequest(new { error = "Agrega destinatarios antes de programar el envío." });
+        }
+
+        campaign.Channel = channel;
+        campaign.ScheduledAt = request.ScheduledAt;
+        campaign.Status = "Scheduled";
+        await _context.SaveChangesAsync();
+
+        campaign = (await _context.Campaigns.Include(c => c.Recipients).FirstOrDefaultAsync(c => c.Id == id))!;
+        return Ok(ToResponse(campaign));
     }
 
-    private static string TextToHtml(string text)
+    [HttpDelete("{id:int}/schedule")]
+    public async Task<IActionResult> CancelSchedule(int id)
     {
-        // Texto plano -> HTML simple, respetando saltos de línea.
-        return $"<div style='font-family:Arial,sans-serif;font-size:15px;color:#333;white-space:pre-wrap;'>{System.Net.WebUtility.HtmlEncode(text).Replace("\n", "<br>")}</div>";
+        var campaign = await _context.Campaigns.FindAsync(id);
+        if (campaign == null) return NotFound(new { error = $"No se encontró la campaña {id}" });
+
+        if (campaign.Status != "Scheduled")
+        {
+            return BadRequest(new { error = "Esta campaña no está programada." });
+        }
+
+        campaign.Status = "Draft";
+        campaign.ScheduledAt = null;
+        await _context.SaveChangesAsync();
+
+        campaign = (await _context.Campaigns.Include(c => c.Recipients).FirstOrDefaultAsync(c => c.Id == id))!;
+        return Ok(ToResponse(campaign));
     }
 
-    private static bool LooksLikeHtml(string text) => text.TrimStart().StartsWith("<");
+    [HttpDelete("{id:int}/recipients/{recipientId:int}")]
+    public async Task<IActionResult> RemoveRecipient(int id, int recipientId)
+    {
+        var recipient = await _context.CampaignRecipients
+            .FirstOrDefaultAsync(r => r.Id == recipientId && r.CampaignId == id);
+        if (recipient == null) return NotFound(new { error = "No se encontró el destinatario." });
+
+        // Los CommunicationLogs se conservan: son el historial de lo que realmente se envió.
+        _context.CampaignRecipients.Remove(recipient);
+        await _context.SaveChangesAsync();
+        return Ok(new { deleted = recipientId });
+    }
+
+    [HttpGet("{id:int}/logs")]
+    public async Task<IActionResult> GetLogs(int id)
+    {
+        var campaignExists = await _context.Campaigns.AnyAsync(c => c.Id == id);
+        if (!campaignExists) return NotFound(new { error = $"No se encontró la campaña {id}" });
+
+        var logs = await _context.CommunicationLogs
+            .Where(l => l.CampaignId == id)
+            .OrderByDescending(l => l.CreatedAt)
+            .Take(500)
+            .Select(l => new
+            {
+                l.Id,
+                l.Channel,
+                l.Recipient,
+                l.Status,
+                l.ErrorMessage,
+                l.CreatedAt,
+                ContactName = l.Contact != null
+                    ? (l.Contact.FirstName + " " + l.Contact.LastName).Trim()
+                    : null
+            })
+            .ToListAsync();
+
+        return Ok(logs);
+    }
+
+    [HttpGet("{id:int}/render")]
+    public async Task<IActionResult> RenderPreview(int id, [FromQuery] int? contactId = null)
+    {
+        var campaign = await _context.Campaigns.FindAsync(id);
+        if (campaign == null) return NotFound(new { error = $"No se encontró la campaña {id}" });
+
+        Models.Contact? contact = null;
+        int? sourceEventId = null;
+
+        if (contactId.HasValue)
+        {
+            contact = await _context.Contacts.FindAsync(contactId.Value);
+            sourceEventId = await _context.CampaignRecipients
+                .Where(r => r.CampaignId == id && r.ContactId == contactId.Value)
+                .Select(r => r.SourceEventId)
+                .FirstOrDefaultAsync();
+        }
+        else
+        {
+            // Sin contactId se usa el primer destinatario de la campaña como muestra.
+            var first = await _context.CampaignRecipients
+                .Include(r => r.Contact)
+                .Where(r => r.CampaignId == id)
+                .OrderBy(r => r.Id)
+                .FirstOrDefaultAsync();
+            contact = first?.Contact;
+            sourceEventId = first?.SourceEventId;
+        }
+
+        var eventName = string.Empty;
+        if (sourceEventId.HasValue)
+        {
+            eventName = await _context.Events
+                .Where(e => e.Id == sourceEventId.Value)
+                .Select(e => e.Name)
+                .FirstOrDefaultAsync() ?? string.Empty;
+        }
+
+        var rendered = CampaignSendService.RenderText(campaign.MessageTemplate, contact, eventName);
+        return Ok(new
+        {
+            contactName = contact != null ? $"{contact.FirstName} {contact.LastName}".Trim() : null,
+            rendered
+        });
+    }
+
+    [HttpPost("{id:int}/duplicate")]
+    public async Task<IActionResult> DuplicateCampaign(int id)
+    {
+        var campaign = await _context.Campaigns.FindAsync(id);
+        if (campaign == null) return NotFound(new { error = $"No se encontró la campaña {id}" });
+
+        var copy = new Campaign
+        {
+            Name = $"{campaign.Name} (copia)",
+            Purpose = campaign.Purpose,
+            Channel = campaign.Channel,
+            Subject = campaign.Subject,
+            MessageTemplate = campaign.MessageTemplate,
+            CreatedBy = campaign.CreatedBy,
+            Status = "Draft",
+            CreatedAt = DateTime.UtcNow
+        };
+        _context.Campaigns.Add(copy);
+        await _context.SaveChangesAsync();
+
+        // Copiar destinatarios (en Pending: la copia parte de cero, sin historial de envíos).
+        var recipientsToCopy = await _context.CampaignRecipients
+            .Where(r => r.CampaignId == id)
+            .ToListAsync();
+        foreach (var r in recipientsToCopy)
+        {
+            _context.CampaignRecipients.Add(new CampaignRecipient
+            {
+                CampaignId = copy.Id,
+                ContactId = r.ContactId,
+                SourceEventId = r.SourceEventId,
+                RecipientAddress = r.RecipientAddress,
+                Status = "Pending",
+                CreatedAt = DateTime.UtcNow
+            });
+        }
+
+        var attachmentsToCopy = await _context.CampaignAttachments
+            .Where(a => a.CampaignId == id)
+            .ToListAsync();
+        foreach (var a in attachmentsToCopy)
+        {
+            _context.CampaignAttachments.Add(new CampaignAttachment
+            {
+                CampaignId = copy.Id,
+                FileName = a.FileName,
+                ContentType = a.ContentType,
+                Content = a.Content,
+                Size = a.Size,
+                CreatedAt = DateTime.UtcNow
+            });
+        }
+
+        await _context.SaveChangesAsync();
+
+        var created = (await _context.Campaigns.Include(c => c.Recipients).FirstOrDefaultAsync(c => c.Id == copy.Id))!;
+        return CreatedAtAction(nameof(GetCampaign), new { id = copy.Id }, ToResponse(created));
+    }
 
     [HttpDelete("{id:int}/recipients")]
     public async Task<IActionResult> ClearRecipients(int id)
@@ -815,7 +751,8 @@ public class CampaignsController : ControllerBase
                 Status = r.Status,
                 SourceEventId = r.SourceEventId,
                 CreatedAt = r.CreatedAt,
-                SentAt = r.SentAt
+                SentAt = r.SentAt,
+                ErrorMessage = r.ErrorMessage
             })
             .ToListAsync();
 

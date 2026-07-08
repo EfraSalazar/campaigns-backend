@@ -33,9 +33,8 @@ public class ContactsController : ControllerBase
             .ThenBy(c => c.FirstName);
 
         var total = await query.CountAsync();
-        var contacts = await query
-            .Skip(filter.Offset)
-            .Take(filter.Limit)
+        var items = await ContactQueryService.ProjectToResponse(
+                query.Skip(filter.Offset).Take(filter.Limit))
             .ToListAsync();
 
         return Ok(new
@@ -43,7 +42,7 @@ public class ContactsController : ControllerBase
             total,
             filter.Offset,
             filter.Limit,
-            items = contacts.Select(ContactQueryService.ToResponse)
+            items
         });
     }
 

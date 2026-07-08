@@ -39,10 +39,19 @@ public class CampaignRecipientResponse
     // Estado por canal según CommunicationLogs (multicanal).
     public string? EmailStatus { get; set; }
     public string? WhatsAppStatus { get; set; }
+    // Motivo del último fallo, para mostrarlo en el panel.
+    public string? ErrorMessage { get; set; }
 }
 
 public class AddRecipientsFromFilterRequest : ContactFilterRequest
 {
+}
+
+public class ScheduleCampaignRequest
+{
+    // Hora de pared CDMX (convención MexicoNow).
+    public DateTime ScheduledAt { get; set; }
+    public string? Channel { get; set; }
 }
 
 public class AddRecipientsByIdsRequest
